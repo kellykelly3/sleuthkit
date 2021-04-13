@@ -24,8 +24,10 @@ import java.sql.PreparedStatement;
 import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.sql.Statement;
+import java.sql.Types;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Objects;
 import java.util.Optional;
 import java.util.UUID;
 import java.util.logging.Logger;
@@ -72,7 +74,7 @@ public final class OsAccountRealmManager {
 	 * @throws OsAccountManager.NotUserSIDException If the SID is not a user
 	 *                                              SID.
 	 */
-	public OsAccountRealm createWindowsRealm(String accountSid, String realmName, Host referringHost, OsAccountRealm.RealmScope realmScope) throws TskCoreException, OsAccountManager.NotUserSIDException {
+	public OsAccountRealm newWindowsRealm(String accountSid, String realmName, Host referringHost, OsAccountRealm.RealmScope realmScope) throws TskCoreException, OsAccountManager.NotUserSIDException {
 
 		if (realmScope == null) {
 			throw new TskCoreException("RealmScope cannot be null. Use UNKNOWN if scope is not known.");
@@ -132,7 +134,7 @@ public final class OsAccountRealmManager {
 		String signature = makeRealmSignature(realmAddr, realmName, scopeHost);
 		
 		// create a realm
-		return createRealm(realmName, realmAddr, signature, scopeHost, scopeConfidence);
+		return newRealm(realmName, realmAddr, signature, scopeHost, scopeConfidence);
 	}
 	
 	/**
@@ -220,72 +222,193 @@ public final class OsAccountRealmManager {
 		return realm;
 	}
 	
+	
 	/**
-	 * Updates the specified realm in the database.
-     * NOTE: This will not merge two realms if the updated information exists
+	 * Get a windows realm by the account SID, or the domain name. The input SID
+	 * is an user/group account SID. The domain SID is extracted from this
+	 * incoming SID.
+	 *
+	 * If a realm is found but is missing either the SID or the realmName, then
+	 * the realm is updated.
+	 *
+	 * @param accountSid    Account SID, may be null.
+	 * @param realmName     Realm name, may be null only if accountSid is not
+	 *                      null.
+	 * @param referringHost Referring Host.
+	 * @param connection    Database connection to use.
+	 *
+	 * @return Optional with OsAccountRealm, Optional.empty if no matching realm
+	 *         is found.
+	 *
+	 * @throws TskCoreException
+	 */
+	Optional<OsAccountRealm> getAndUpdateWindowsRealm(String accountSid, String realmName, Host referringHost, CaseDbConnection connection) throws TskCoreException, OsAccountManager.NotUserSIDException {
+		
+		// get realm
+		Optional<OsAccountRealm> realmOptional =  getWindowsRealm(accountSid, realmName, referringHost, connection );
+		
+		// if found, update it if needed
+		if (realmOptional.isPresent()) {
+			String realmAddr = StringUtils.isNotBlank(accountSid) ? WindowsAccountUtils.getWindowsRealmAddress(accountSid) : null;
+			OsRealmUpdateResult realmUpdateResult = updateRealm(realmOptional.get(), realmAddr, realmName, connection);
+			
+			// if realm was updated, return the updated realm
+			if (realmUpdateResult.getUpdateStatus() == OsRealmUpdateStatus.UPDATED) {
+				return realmUpdateResult.getUpdatedRealm();
+			} 
+		} 
+		
+		return realmOptional; // return the found realm as is, if any
+	}
+	
+	
+	/**
+	 * Updates the realm address and/or name, if a non blank address/name is
+	 * specified and the current address/name is blank.
+	 * 
+	 * NOTE: This will not merge two realms if the updated information exists
      * for another realm (i.e. such as adding an address to a realm that has
      * only a name and there is already a realm with that address). 
 	 * 
-	 * @param realm Realm to update.
+	 *
+	 * @param realm      Realm to update.
+	 * @param realmAddr  Realm address, may be null if the address doesn't need
+	 *                   to be updated.
+	 * @param realmName  Realm name, may be null if the name doesn't need to be
+	 *                   updated.
 	 * 
-	 * @return OsAccountRealm Updated realm.
+	 * @return OsRealmUpdateResult Update status and updated realm.
 	 * 
 	 * @throws TskCoreException If there is a database error or if a realm
      * already exists with that information. 
 	 */
-	public OsAccountRealm updateRealm(OsAccountRealm realm) throws TskCoreException {
-		
-		// do nothing if the realm is not dirty.
-		if (!realm.isDirty()) {
-			return realm;
-		}
+	public OsRealmUpdateResult updateRealm(OsAccountRealm realm, String realmAddr, String realmName) throws TskCoreException {
 		
 		try (CaseDbConnection connection = db.getConnection())  {
-			return updateRealm(realm, connection);
+			return updateRealm(realm, realmAddr, realmName, connection);
 		}
 	}
 		
 	/**
-	 * Updates the specified realm in the database.
-	 * 
-	 * @param realm Realm to update.
+	 * Updates the realm address and/or name, if a non blank address/name is
+	 * specified and the current address/name is blank.
+	 *
+	 * @param realm      Realm to update.
+	 * @param realmAddr  Realm address, may be null if the address doesn't need
+	 *                   to be updated.
+	 * @param realmName  Realm name, may be null if the name doesn't need to be
+	 *                   updated.
 	 * @param connection Current database connection.
-	 * 
-	 * @return OsAccountRealm Updated realm.
-	 * 
-	 * @throws TskCoreException 
+	 *
+	 * @return OsRealmUpdateResult Update status and updated realm.
+	 *
+	 * @throws TskCoreException If there is a database error or if a realm
+	 *                          already exists with that information.
 	 */
-	private OsAccountRealm updateRealm(OsAccountRealm realm, CaseDbConnection connection) throws TskCoreException {
-		
-		// do nothing if the realm is not dirty.
-		if (!realm.isDirty()) {
-			return realm;
-		}		
-		
-		List<String> realmNames = realm.getRealmNames();
-		String realmName = realmNames.isEmpty() ? null : realmNames.get(0);
-			
+	private OsRealmUpdateResult updateRealm(OsAccountRealm realm, String realmAddr, String realmName, CaseDbConnection connection) throws TskCoreException {
+
+		// need at least one of the two
+		if (StringUtils.isBlank(realmAddr) && StringUtils.isBlank(realmName)) {
+			throw new TskCoreException("Realm address or name is required to update realm.");
+		}
+
+		OsRealmUpdateStatus updateStatusCode = OsRealmUpdateStatus.NO_CHANGE;
+		OsAccountRealm updatedRealm = null;
+
 		db.acquireSingleUserCaseWriteLock();
 		try {
-			// We only alow realm addr, name and signature to be updated at this time. 
+			List<String> realmNames = realm.getRealmNames();
+			String currRealmName = realmNames.isEmpty() ? null : realmNames.get(0);	// currently there is only one name.
+			String currRealmAddr = realm.getRealmAddr().orElse(null);
+
+			// set name and address to new values only if the current value is blank and the new value isn't.		
+			if ((StringUtils.isBlank(currRealmAddr) && StringUtils.isNotBlank(realmAddr))) {
+				updateRealmColumn(realm.getRealmId(), "realm_addr", realmAddr, connection);
+				updateStatusCode = OsRealmUpdateStatus.UPDATED;
+			}
+
+			if (StringUtils.isBlank(currRealmName) && StringUtils.isNotBlank(realmName)) {
+				updateRealmColumn(realm.getRealmId(), "realm_name", realmName, connection);
+				updateStatusCode = OsRealmUpdateStatus.UPDATED;
+			}
+
+			// if nothing is to be changed, return
+			if (updateStatusCode == OsRealmUpdateStatus.NO_CHANGE) {
+				return new OsRealmUpdateResult(updateStatusCode, realm);
+			}
+
+			// update realm signature - based on the most current address and name
+			OsAccountRealm currRealm = getRealmByRealmId(realm.getRealmId(), connection);
+			String newRealmAddr = currRealm.getRealmAddr().orElse(null);
+			String newRealmName = (currRealm.getRealmNames().isEmpty() == false) ? currRealm.getRealmNames().get(0) : null;
+
+			// make new signature
+			String newSignature = makeRealmSignature(newRealmAddr, newRealmName, realm.getScopeHost().orElse(null));
+
 			// Use a random string as the signature if the realm is not active.
-			String updateSQL = "UPDATE tsk_os_account_realms SET realm_name = ?,  realm_addr = ?, " 
-					+  " realm_signature = "
+			String updateSQL = "UPDATE tsk_os_account_realms SET  "
+					+ " realm_signature = "
 					+ "   CASE WHEN db_status = " + OsAccountRealm.RealmDbStatus.ACTIVE.getId() + " THEN ? ELSE realm_signature END "
 					+ " WHERE id = ?";
 			PreparedStatement preparedStatement = connection.getPreparedStatement(updateSQL, Statement.NO_GENERATED_KEYS);
 			preparedStatement.clearParameters();
-			
-			preparedStatement.setString(1, realmName);
-			preparedStatement.setString(2, realm.getRealmAddr().orElse(null));
-			preparedStatement.setString(3, realm.getSignature()); // Is only set for active accounts
-			preparedStatement.setLong(4, realm.getRealmId());
+
+			preparedStatement.setString(1, newSignature); // Is only set for active accounts
+			preparedStatement.setLong(2, realm.getRealmId());
 			connection.executeUpdate(preparedStatement);
-			
-			realm.resetDirty();
-			return realm;
+
+			// read the updated realm
+			updatedRealm = this.getRealmByRealmId(realm.getRealmId(), connection);
+
+			return new OsRealmUpdateResult(updateStatusCode, updatedRealm);
 		} catch (SQLException ex) {
-			throw new TskCoreException(String.format("Error updating realm with id = %d, name = %s, addr = %s", realm.getRealmId(), realmName != null ? realmName : "Null", realm.getRealmAddr().orElse("Null") ), ex);
+			throw new TskCoreException(String.format("Error updating realm with id = %d, name = %s, addr = %s", realm.getRealmId(), realmName != null ? realmName : "Null", realm.getRealmAddr().orElse("Null")), ex);
+		} finally {
+			db.releaseSingleUserCaseWriteLock();
+		}
+
+	}
+
+	/**
+	 * Updates specified column in the tsk_os_account_realms table to the specified value.
+	 * 
+	 * @param <T> Type of value - must be a String, Long or an Integer. 
+	 * @param realmId Id of the realm to be updated.
+	 * @param colName Name of column o be updated.
+	 * @param colValue New column value. 
+	 * @param connection Database connection to use.
+	 * 
+	 * @throws SQLException If there is an error updating the database.
+	 * @throws TskCoreException  If the value type is not handled.
+	 */
+	private <T> void updateRealmColumn(long realmId, String colName, T colValue, CaseDbConnection connection) throws SQLException, TskCoreException {
+
+		String updateSQL = "UPDATE tsk_os_account_realms "
+				+ " SET " + colName + " = ? "
+				+ " WHERE id = ?";
+
+		db.acquireSingleUserCaseWriteLock();
+		try {
+			PreparedStatement preparedStatement = connection.getPreparedStatement(updateSQL, Statement.NO_GENERATED_KEYS);
+			preparedStatement.clearParameters();
+
+			if (Objects.isNull(colValue)) {
+				preparedStatement.setNull(1, Types.NULL); // handle null value
+			} else {
+				if (colValue instanceof String) {
+					preparedStatement.setString(1, (String) colValue);
+				} else if (colValue instanceof Long) {
+					preparedStatement.setLong(1, (Long) colValue);
+				} else if (colValue instanceof Integer) {
+					preparedStatement.setInt(1, (Integer) colValue);
+				} else {
+					throw new TskCoreException(String.format("Unhandled column data type received while updating the realm (id = %d) ", realmId));
+				}
+			}
+
+			preparedStatement.setLong(2, realmId);
+
+			connection.executeUpdate(preparedStatement);
 		} finally {
 			db.releaseSingleUserCaseWriteLock();
 		}
@@ -307,9 +430,9 @@ public final class OsAccountRealmManager {
 	 * @throws TskCoreException on error 
 	 */
 
-	public OsAccountRealm getRealmById(long id) throws TskCoreException {
+	public OsAccountRealm getRealmByRealmId(long id) throws TskCoreException {
 		try (CaseDbConnection connection = this.db.getConnection()) {
-			return getRealmById(id, connection);
+			return getRealmByRealmId(id, connection);
 		}
 	}
 	
@@ -322,7 +445,7 @@ public final class OsAccountRealmManager {
 	 * @return Realm. 
 	 * @throws TskCoreException 
 	 */
-	OsAccountRealm getRealmById(long id, CaseDbConnection connection) throws TskCoreException {
+	OsAccountRealm getRealmByRealmId(long id, CaseDbConnection connection) throws TskCoreException {
 		
 		String queryString = REALM_QUERY_STRING
 					+ " WHERE realms.id = " + id;
@@ -566,7 +689,7 @@ public final class OsAccountRealmManager {
 	 *
 	 * @throws TskCoreException If there is an internal error.
 	 */
-	private OsAccountRealm createRealm(String realmName, String realmAddr, String signature, Host host, OsAccountRealm.ScopeConfidence scopeConfidence) throws TskCoreException {
+	private OsAccountRealm newRealm(String realmName, String realmAddr, String signature, Host host, OsAccountRealm.ScopeConfidence scopeConfidence) throws TskCoreException {
 
 		db.acquireSingleUserCaseWriteLock();
 		try (CaseDbConnection connection = this.db.getConnection()) {
@@ -703,7 +826,7 @@ public final class OsAccountRealmManager {
 					// Merge the realm with the matching name into the realm with the matching address.
 					// Reload from database afterward to make sure everything is up-to-date.
 					mergeRealms(optDestRealmName.get(), optDestRealmAddr.get(), trans);
-					destRealm = getRealmById(optDestRealmAddr.get().getRealmId(), trans.getConnection());
+					destRealm = getRealmByRealmId(optDestRealmAddr.get().getRealmId(), trans.getConnection());
 				}
 			}
 		} else if (optDestRealmAddr.isPresent()) {
@@ -775,11 +898,9 @@ public final class OsAccountRealmManager {
 		
 		// Update the destination realm if it doesn't have the name or addr set and the source realm does
 		if (!destRealm.getRealmAddr().isPresent() && sourceRealm.getRealmAddr().isPresent()) {
-			destRealm.setRealmAddr(sourceRealm.getRealmAddr().get());
-			updateRealm(destRealm, trans.getConnection());
+			updateRealm(destRealm, sourceRealm.getRealmAddr().get(), null, trans.getConnection());
 		} else if (destRealm.getRealmNames().isEmpty() && !sourceRealm.getRealmNames().isEmpty()) {
-			destRealm.addRealmName(sourceRealm.getRealmNames().get(0));
-			updateRealm(destRealm, trans.getConnection());
+			updateRealm(destRealm, null, sourceRealm.getRealmNames().get(0), trans.getConnection());
 		}
 	}
 	
@@ -810,6 +931,39 @@ public final class OsAccountRealmManager {
 		}
 		finally {
 			db.releaseSingleUserCaseReadLock();
+		}
+	}
+	
+	/**
+	 * Status of a realm update.
+	 */
+	public enum OsRealmUpdateStatus {
+
+		NO_CHANGE,	/// no change was made to account.
+		UPDATED,	/// account was updated
+		MERGED		/// account update triggered a merge
+	}
+	
+	/**
+	 * Container to encapsulate the status returned by the realm update api, and
+	 * the updated realm.
+	 */
+	public final static class OsRealmUpdateResult {
+		
+		private final OsRealmUpdateStatus updateStatus;
+		private final OsAccountRealm updatedRealm;
+		
+		OsRealmUpdateResult(OsRealmUpdateStatus updateStatus, OsAccountRealm updatedRealm) {
+			this.updateStatus = updateStatus;
+			this.updatedRealm = updatedRealm;
+		}
+
+		public OsRealmUpdateStatus getUpdateStatus() {
+			return updateStatus;
+		}
+
+		public Optional<OsAccountRealm> getUpdatedRealm() {
+			return Optional.ofNullable(updatedRealm);
 		}
 	}
 }
